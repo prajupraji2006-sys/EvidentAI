@@ -1,52 +1,51 @@
-import hashlib
-import hmac
+﻿from __future__ import annotations
+
+import logging
 import os
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-# Load backend/.env before reading application environment settings.
-from app import config as _config  # noqa: F401
-from app.services.ai_analysis import (
-    EvidenceAnalysis,
-    GeminiServiceError,
-    InvalidGeminiResponseError,
-    analyze_evidence,
-)
+from app import config as _config  # Load backend/.env before application settings.
+from app.security import append_audit_event, authenticated_user
+from app.services.ai_analysis import EvidenceAnalysis, GeminiServiceError, InvalidGeminiResponseError, analyze_evidence
+from app.services.authenticity import assess_file
+from app.services.evidence_processing import MAX_ANALYSIS_TEXT_CHARS, EvidenceTextError, extract_evidence_text
 from app.services.evidence_upload import (
-    EvidenceUploadError,
-    EvidenceUploadResult,
-    SUPPORTED_EXTENSIONS,
-    UPLOAD_DIR,
-    calculate_sha256,
-    find_stored_file,
-    list_evidence_records,
-    read_evidence_metadata,
-    save_evidence_file,
-    save_analysis_result,
-)
-from app.services.evidence_processing import (
-    MAX_ANALYSIS_TEXT_CHARS,
-    EvidenceTextError,
-    extract_evidence_text,
+    EvidenceUploadError, EvidenceUploadResult, calculate_sha256, find_stored_file,
+    get_supabase_client, list_evidence_records, read_evidence_metadata,
+    save_analysis_result, save_evidence_file, set_processing_status, verify_evidence_integrity,
 )
 
-frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-allowed_origins = list(
-    {frontend_origin, "http://localhost:5173", "http://127.0.0.1:5173"}
-)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="EvidentAI API", version="0.1.0", description="Digital evidence intelligence API starter")
+
+def _cors_origins() -> list[str]:
+    configured = os.getenv("FRONTEND_ORIGINS") or os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+    origins = [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+    if os.getenv("APP_ENV", "development").lower() != "production":
+        origins.extend(["http://localhost:5173", "http://127.0.0.1:5173"])
+    return sorted(set(origins))
+
+
+app = FastAPI(title="EvidentAI API", version="0.2.0", description="Authenticated digital evidence intake and intelligence API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins(), allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
+
+
+@app.exception_handler(Exception)
+async def safe_internal_error(_request, exc: Exception):
+    # Avoid returning provider errors, evidence content, or credential-bearing URLs.
+    logger.error("Unhandled API error (error_type=%s)", type(exc).__name__)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=500, content={"detail": "The request could not be completed."})
 
 
 @app.get("/")
@@ -54,17 +53,13 @@ async def root():
     return {"status": "EvidentAI API is running"}
 
 
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "service": "evidentai-api"}
+
+
 class AnalyzeRequest(BaseModel):
-    evidence_text: str = Field(
-        min_length=1,
-        max_length=MAX_ANALYSIS_TEXT_CHARS,
-        description=f"Plain-text evidence to analyze (maximum {MAX_ANALYSIS_TEXT_CHARS:,} characters).",
-        json_schema_extra={
-            "examples": [
-                "On 2025-04-12, Jordan Lee met Casey Morgan at the North Station office."
-            ]
-        },
-    )
+    evidence_text: str = Field(min_length=1, max_length=MAX_ANALYSIS_TEXT_CHARS)
 
     @field_validator("evidence_text")
     @classmethod
@@ -75,88 +70,129 @@ class AnalyzeRequest(BaseModel):
         return value
 
 
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "service": "evidentai-api"}
+class IncidentCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("title")
+    @classmethod
+    def title_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Incident title cannot be blank.")
+        return value
 
 
-@app.post(
-    "/api/analyze",
-    response_model=EvidenceAnalysis,
-    summary="Analyze evidence text with Gemini",
-    description=(
-        "Submit plain-text evidence for structured analysis. The endpoint does not store "
-        "the submitted text. Use the example request in Swagger's request body editor."
-    ),
-)
-def analyze(request: AnalyzeRequest) -> EvidenceAnalysis:
+@app.post("/api/profile/bootstrap")
+def bootstrap_profile(user: dict[str, str] = Depends(authenticated_user)):
+    """Create the authenticated user's profile once, without accepting a client-supplied id or role."""
+    client = get_supabase_client()
+    existing = client.table("profiles").select(
+        "id,full_name,role,created_at,updated_at"
+    ).eq("id", user["id"]).limit(1).execute().data or []
+    if existing:
+        return {"profile": existing[0], "created": False}
+    now = datetime.now(timezone.utc).isoformat()
     try:
-        return analyze_evidence(request.evidence_text)
+        rows = client.table("profiles").insert({
+            "id": user["id"],
+            "role": "investigator",
+            "created_at": now,
+            "updated_at": now,
+        }).execute().data or []
+    except Exception:
+        # A concurrent first request may have inserted the same unique user id.
+        rows = client.table("profiles").select(
+            "id,full_name,role,created_at,updated_at"
+        ).eq("id", user["id"]).limit(1).execute().data or []
+        if not rows:
+            raise HTTPException(status_code=503, detail="The user profile could not be initialized.") from None
+    if not rows:
+        raise HTTPException(status_code=503, detail="The user profile could not be initialized.")
+    return {"profile": rows[0], "created": True}
+
+
+@app.post("/api/analyze", response_model=EvidenceAnalysis)
+def analyze(request: AnalyzeRequest, user: dict[str, str] = Depends(authenticated_user)) -> EvidenceAnalysis:
+    try:
+        result = analyze_evidence(request.evidence_text)
+        append_audit_event(user["id"], "analysis_completed", "text_analysis", None)
+        return result
     except RuntimeError:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Gemini is not configured. Set GEMINI_API_KEY in backend/.env "
-                "and restart the backend."
-            ),
-        ) from None
+        raise HTTPException(status_code=503, detail="Gemini analysis is not configured.") from None
     except InvalidGeminiResponseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from None
     except GeminiServiceError:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini analysis is temporarily unavailable. Please try again.",
-        ) from None
+        raise HTTPException(status_code=502, detail="Gemini analysis is temporarily unavailable. Please retry.") from None
+
+
+@app.get("/api/cases")
+def cases(user: dict[str, str] = Depends(authenticated_user)):
+    rows = get_supabase_client().table("incidents").select(
+        "id,owner_id,incident_number,title,description,status,created_at,updated_at"
+    ).eq("owner_id", user["id"]).order("created_at", desc=True).execute().data or []
+    return {"cases": rows}
+
+
+@app.post("/api/audit/login")
+def record_login(user: dict[str, str] = Depends(authenticated_user)):
+    return {"recorded": append_audit_event(user["id"], "login", "account", user["id"])}
+
+
+@app.post("/api/cases", status_code=201)
+def create_case(request: IncidentCreateRequest, user: dict[str, str] = Depends(authenticated_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    case_id = uuid4()
+    row = {
+        "id": str(case_id), "owner_id": user["id"],
+        "incident_number": f"INC-{case_id.hex[:8].upper()}",
+        "title": request.title, "description": request.description,
+        "status": "active", "created_at": now, "updated_at": now,
+    }
+    saved = get_supabase_client().table("incidents").insert(row).execute().data or []
+    if not saved:
+        raise HTTPException(status_code=503, detail="The incident could not be saved.")
+    append_audit_event(user["id"], "incident_created", "incident", str(case_id))
+    return {"case": saved[0]}
 
 
 @app.get("/api/dashboard")
-async def dashboard():
-    records = list_evidence_records()
-    analyzed_records = [record for record in records if record.get("analysis")]
-    events_count = sum(
-        len(record["analysis"].get("events", []))
-        for record in analyzed_records
-        if isinstance(record.get("analysis"), dict)
-    )
+def dashboard(user: dict[str, str] = Depends(authenticated_user)):
+    records = list_evidence_records(user["id"])
+    cases_response = get_supabase_client().table("incidents").select("id,status").eq("owner_id", user["id"]).execute()
+    analyses = [row.get("analysis") or {} for row in records if row.get("analysis")]
     return {
-        "active_investigations": 0,
+        "active_investigations": sum(1 for case in (cases_response.data or []) if case.get("status") == "active"),
         "evidence_items": len(records),
-        "events_identified": events_count,
+        "events_identified": sum(len(item.get("events", [])) for item in analyses),
         "integrity_verified_percent": None,
-        "processing_items": 0,
+        "processing_items": sum(1 for row in records if row.get("processing_status") in {"uploaded", "processing"}),
         "recent_evidence": records[:5],
     }
 
 
-@app.get("/api/cases")
-async def cases():
-    # Cases will be supplied by the future database integration.
-    return {"cases": []}
-
-
 @app.get("/api/evidence")
-async def evidence_list():
-    return {"items": list_evidence_records()}
+def evidence_list(user: dict[str, str] = Depends(authenticated_user)):
+    return {"items": list_evidence_records(user["id"])}
 
 
-@app.post(
-    "/api/evidence/upload",
-    response_model=EvidenceUploadResult,
-    summary="Upload and verify an evidence file",
-    description=(
-        "Accepts one PDF, image, text/CSV, or audio file up to 200 MB. "
-        "The file is temporarily stored under backend/uploads and hashed with SHA-256. "
-        "Files are not persisted to a database."
-    ),
-)
-def upload_evidence(file: UploadFile = File(...)) -> EvidenceUploadResult:
+@app.post("/api/evidence/upload", response_model=EvidenceUploadResult)
+def upload_evidence(file: UploadFile = File(...), incident_id: UUID = Form(...), user: dict[str, str] = Depends(authenticated_user)) -> EvidenceUploadResult:
     try:
-        return save_evidence_file(file)
+        result = save_evidence_file(file, incident_id, user["id"])
     except EvidenceUploadError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+    append_audit_event(user["id"], "evidence_uploaded", "evidence", str(result.evidence_id), {
+        "incident_id": str(incident_id), "file_size": result.file_size,
+        "sha256_hash": result.sha256_hash, "exact_duplicate": result.exact_duplicate,
+    })
+    append_audit_event(user["id"], "hash_created", "evidence", str(result.evidence_id), {
+        "algorithm": "SHA-256", "sha256_hash": result.sha256_hash,
+    })
+    return result
 
 
-class PDFAnalysisResponse(BaseModel):
+class EvidenceAnalysisResponse(BaseModel):
     evidence_id: str
     original_filename: str
     extracted_text_preview: str
@@ -165,229 +201,235 @@ class PDFAnalysisResponse(BaseModel):
     analysis: EvidenceAnalysis
 
 
-@app.post(
-    "/api/evidence/{evidence_id}/analyze",
-    response_model=PDFAnalysisResponse,
-    summary="Extract and analyze uploaded evidence",
-    description=(
-        "First upload a supported file with POST /api/evidence/upload and copy its evidence_id. "
-        "Submit that UUID here to extract text, run OCR, or transcribe audio as appropriate, "
-        "then analyze the extracted content with Gemini. Only a short preview is returned."
-    ),
-)
-def analyze_uploaded_evidence(evidence_id: UUID) -> PDFAnalysisResponse:
+def _analyze_evidence_job(evidence_id: UUID, user_id: str) -> EvidenceAnalysisResponse:
+    metadata = read_evidence_metadata(evidence_id, user_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Evidence file was not found.")
+    evidence_path = find_stored_file(evidence_id, user_id)
     try:
-        evidence_path = find_stored_file(evidence_id)
-        if evidence_path is None:
-            raise HTTPException(status_code=404, detail="Evidence file was not found.")
-        metadata = read_evidence_metadata(evidence_id)
-        file_type = metadata.get(
-            "file_type", SUPPORTED_EXTENSIONS.get(evidence_path.suffix.lower())
-        )
-        extracted_text, extraction_method = extract_evidence_text(evidence_path, file_type or "")
+        extracted_text, extraction_method = extract_evidence_text(evidence_path, metadata.get("evidence_type", ""))
         if len(extracted_text) > MAX_ANALYSIS_TEXT_CHARS:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"Extracted content exceeds the {MAX_ANALYSIS_TEXT_CHARS:,} character "
-                    "analysis limit. Use a shorter file or split the evidence."
-                ),
-            )
+            raise HTTPException(status_code=413, detail=f"Extracted content exceeds the {MAX_ANALYSIS_TEXT_CHARS:,} character analysis limit.")
         analysis = analyze_evidence(extracted_text)
-        preview = extracted_text[:500]
-        preview += "… [preview only]" if len(extracted_text) > 500 else " [preview only]"
-        save_analysis_result(evidence_id, analysis.model_dump(mode="json"), preview)
-    except EvidenceTextError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+        preview = extracted_text[:500] + ("… [preview only]" if len(extracted_text) > 500 else " [preview only]")
+        save_analysis_result(evidence_id, user_id, analysis.model_dump(mode="json"), preview, extraction_method)
+        append_audit_event(user_id, "analysis_completed", "evidence", str(evidence_id), {"extraction_method": extraction_method})
+        return EvidenceAnalysisResponse(
+            evidence_id=str(evidence_id), original_filename=metadata.get("original_filename", "Evidence file"),
+            extracted_text_preview=preview, extraction_status="processed", extraction_method=extraction_method, analysis=analysis,
+        )
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+@app.post("/api/evidence/{evidence_id}/analyze", response_model=EvidenceAnalysisResponse)
+def analyze_uploaded_evidence(evidence_id: UUID, user: dict[str, str] = Depends(authenticated_user)):
+    try:
+        set_processing_status(evidence_id, user["id"], "processing")
+        append_audit_event(user["id"], "analysis_started", "evidence", str(evidence_id))
+        return _analyze_evidence_job(evidence_id, user["id"])
     except HTTPException:
+        try:
+            set_processing_status(evidence_id, user["id"], "failed", "Evidence processing failed. Retry when the file and required services are available.")
+            append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id))
+        except Exception:
+            pass
         raise
+    except HTTPException:
+        try:
+            set_processing_status(evidence_id, user["id"], "failed", "Evidence processing failed. Retry when the source file and required services are available.")
+            append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id))
+        except Exception:
+            pass
+        raise
+    except EvidenceTextError as exc:
+        set_processing_status(evidence_id, user["id"], "failed", str(exc))
+        append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id), {"error_type": type(exc).__name__})
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
     except RuntimeError:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Gemini is not configured. Set GEMINI_API_KEY in backend/.env "
-                "and restart the backend."
-            ),
-        ) from None
+        set_processing_status(evidence_id, user["id"], "failed", "Gemini analysis is not configured.")
+        append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id), {"error_type": "configuration"})
+        raise HTTPException(status_code=503, detail="Gemini analysis is not configured.") from None
     except InvalidGeminiResponseError as exc:
+        set_processing_status(evidence_id, user["id"], "failed", str(exc))
+        append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id), {"error_type": "invalid_model_response"})
         raise HTTPException(status_code=502, detail=str(exc)) from None
     except GeminiServiceError:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini analysis is temporarily unavailable. Please try again.",
-        ) from None
-    except OSError:
-        raise HTTPException(
-            status_code=500,
-            detail="Analysis completed, but its result could not be saved. Please retry.",
-        ) from None
-    return PDFAnalysisResponse(
-        evidence_id=str(evidence_id),
-        original_filename=metadata.get("original_filename", evidence_path.name),
-        extracted_text_preview=preview,
-        extraction_status="completed",
-        extraction_method=extraction_method,
-        analysis=analysis,
-    )
+        set_processing_status(evidence_id, user["id"], "failed", "Gemini analysis is temporarily unavailable.")
+        append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id), {"error_type": "ai_provider"})
+        raise HTTPException(status_code=502, detail="Gemini analysis is temporarily unavailable. Please retry.") from None
+    except EvidenceUploadError as exc:
+        try:
+            set_processing_status(evidence_id, user["id"], "failed", "The stored evidence could not be retrieved for processing.")
+            append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id), {"error_type": "storage"})
+        except Exception:
+            pass
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
 
 
 @app.get("/api/timeline")
-async def timeline():
+def timeline(user: dict[str, str] = Depends(authenticated_user)):
     events = []
-    for record in list_evidence_records():
-        analysis = record.get("analysis") or {}
-        for event in analysis.get("events", []):
-            events.append({
-                **event,
-                "evidence_id": record["evidence_id"],
-                "original_filename": record["original_filename"],
-            })
-
-    def event_sort_key(event):
-        date_or_time = event.get("date_or_time", "")
+    for record in list_evidence_records(user["id"]):
+        for event in (record.get("analysis") or {}).get("events", []):
+            events.append({**event, "evidence_id": record["evidence_id"], "original_filename": record["original_filename"]})
+    def event_sort_key(item):
+        value = str(item.get("date_or_time") or "")
         try:
-            parsed = datetime.fromisoformat(date_or_time.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             return (0, parsed.timestamp())
         except (TypeError, ValueError):
-            return (1, str(date_or_time).casefold())
-
+            return (1, value.casefold())
     events.sort(key=event_sort_key)
     return {"events": events}
 
 
 @app.get("/api/graph")
-async def graph():
-    nodes_by_id = {}
-    edges_by_id = {}
-
-    def add_relationship_node(kind: str, label: str, evidence_id: str):
-        normalized = label.strip()
-        if not normalized:
-            return
-        node_id = f"{kind}:{normalized.casefold()}"
-        nodes_by_id[node_id] = {"id": node_id, "label": normalized, "type": kind}
-        evidence_node_id = f"evidence:{evidence_id}"
-        edge_id = f"{node_id}->{evidence_node_id}"
-        edges_by_id[edge_id] = {
-            "id": edge_id,
-            "source": node_id,
-            "target": evidence_node_id,
-            "label": "mentioned in",
-        }
-
-    for record in list_evidence_records():
+def graph(user: dict[str, str] = Depends(authenticated_user)):
+    nodes: dict[str, dict] = {}
+    edges: dict[str, dict] = {}
+    for record in list_evidence_records(user["id"]):
         evidence_id = record["evidence_id"]
-        evidence_node_id = f"evidence:{evidence_id}"
-        nodes_by_id[evidence_node_id] = {
-            "id": evidence_node_id,
-            "label": record["original_filename"],
-            "type": "evidence",
-        }
+        target = f"evidence:{evidence_id}"
+        nodes[target] = {"id": target, "label": record["original_filename"], "type": "evidence", "evidence_id": evidence_id}
         analysis = record.get("analysis") or {}
-        for category, node_type in (("people", "person"), ("locations", "location"), ("dates", "date")):
+        for category, kind in (("people", "person"), ("locations", "location"), ("dates", "date")):
             for value in analysis.get(category, []):
-                add_relationship_node(node_type, value, evidence_id)
+                label = str(value).strip()
+                if not label:
+                    continue
+                node_id = f"{kind}:{label.casefold()}"
+                if node_id not in nodes:
+                    nodes[node_id] = {"id": node_id, "label": label, "type": kind, "source_evidence_ids": []}
+                if evidence_id not in nodes[node_id]["source_evidence_ids"]:
+                    nodes[node_id]["source_evidence_ids"].append(evidence_id)
+                edge_id = f"{node_id}->{target}"
+                edges[edge_id] = {"id": edge_id, "source": node_id, "target": target, "label": "mentioned in", "evidence_id": evidence_id}
         for index, event in enumerate(analysis.get("events", [])):
-            label = event.get("description", "").strip()
-            event_key = f"event:{evidence_id}:{index}"
+            label = str(event.get("description", "")).strip()
             if label:
-                nodes_by_id[event_key] = {"id": event_key, "label": label, "type": "event"}
-                edge_id = f"{event_key}->{evidence_node_id}"
-                edges_by_id[edge_id] = {
-                    "id": edge_id,
-                    "source": event_key,
-                    "target": evidence_node_id,
-                    "label": "derived from",
-                }
-
-    return {"nodes": list(nodes_by_id.values()), "edges": list(edges_by_id.values())}
+                node_id = f"event:{evidence_id}:{index}"
+                nodes[node_id] = {"id": node_id, "label": label, "type": "event", "source_evidence_ids": [evidence_id]}
+                edge_id = f"{node_id}->{target}"
+                edges[edge_id] = {"id": edge_id, "source": node_id, "target": target, "label": "derived from", "evidence_id": evidence_id}
+    return {"nodes": list(nodes.values()), "edges": list(edges.values())}
 
 
 @app.get("/api/summary")
-async def summary():
-    records = [record for record in list_evidence_records() if record.get("analysis")]
-    analyses = [record["analysis"] for record in records]
-
+def summary(user: dict[str, str] = Depends(authenticated_user)):
+    records = [row for row in list_evidence_records(user["id"]) if row.get("analysis")]
+    analyses = [row["analysis"] for row in records]
     def unique_values(field: str) -> list[str]:
-        values = []
-        seen = set()
-        for item in analyses:
-            for value in item.get(field, []):
-                normalized = value.strip()
-                if normalized and normalized.casefold() not in seen:
-                    seen.add(normalized.casefold())
-                    values.append(normalized)
-        return values
+        result: list[str] = []
+        seen: set[str] = set()
+        for analysis in analyses:
+            for item in analysis.get(field, []):
+                value = str(item).strip()
+                if value and value.casefold() not in seen:
+                    seen.add(value.casefold())
+                    result.append(value)
+        return result
+    summaries = [str(item.get("summary", "")).strip() for item in analyses if item.get("summary")]
+    events = [{**event, "evidence_id": row["evidence_id"], "original_filename": row["original_filename"]} for row in records for event in row["analysis"].get("events", [])]
+    return {"summary": "\n\n".join(summaries), "people": unique_values("people"), "locations": unique_values("locations"),
+            "dates": unique_values("dates"), "events": events, "concerns": unique_values("concerns"), "evidence_count": len(records),
+            "generated_at": datetime.now(timezone.utc).isoformat() if analyses else None}
 
-    summaries = [item.get("summary", "").strip() for item in analyses if item.get("summary")]
-    events = [event for item in analyses for event in item.get("events", [])]
-    return {
-        "summary": "\n\n".join(summaries),
-        "people": unique_values("people"),
-        "locations": unique_values("locations"),
-        "dates": unique_values("dates"),
-        "events": events,
-        "concerns": unique_values("concerns"),
-        "evidence_count": len(records),
-        "generated_at": datetime.now(timezone.utc).isoformat() if analyses else None,
-    }
+
+@app.post("/api/evidence/{evidence_id}/authenticity-assessment")
+def create_authenticity_assessment(evidence_id: UUID, user: dict[str, str] = Depends(authenticated_user)):
+    metadata = read_evidence_metadata(evidence_id, user["id"])
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Evidence file was not found.")
+    path = find_stored_file(evidence_id, user["id"])
+    try:
+        assessment = assess_file(path, metadata.get("evidence_type", ""))
+        client = get_supabase_client()
+        hash_rows = client.table("evidence_hashes").select(
+            "sha256_hash"
+        ).eq("evidence_id", str(evidence_id)).limit(1).execute().data or []
+        if hash_rows and hash_rows[0].get("sha256_hash"):
+            expected_hash = str(hash_rows[0]["sha256_hash"])
+            current_hash = calculate_sha256(path)
+            verified = expected_hash.casefold() == current_hash.casefold()
+            verified_at = datetime.now(timezone.utc).isoformat()
+            client.table("evidence_hashes").update({
+                "verified_at": verified_at,
+                "verification_status": "verified" if verified else "failed",
+            }).eq("evidence_id", str(evidence_id)).execute()
+            assessment["integrity_information"] = {
+                "status": "VERIFIED" if verified else "FAILED",
+                "algorithm": "SHA-256",
+                "stored_hash": expected_hash,
+                "current_hash": current_hash,
+                "verified_at": verified_at,
+                "meaning": "A matching hash confirms these stored bytes match the upload hash; it does not prove the source file was genuine.",
+            }
+            append_audit_event(user["id"], "integrity_verified", "evidence", str(evidence_id), {
+                "verification_status": "verified" if verified else "failed",
+            })
+        else:
+            assessment["integrity_information"] = {"status": "NOT VERIFIED", "algorithm": "SHA-256"}
+    finally:
+        path.unlink(missing_ok=True)
+    saved = get_supabase_client().table("authenticity_assessments").insert({
+        "evidence_id": str(evidence_id), "classification": assessment["classification"],
+        "confidence": assessment["confidence"], "assessment": assessment,
+    }).execute().data or []
+    append_audit_event(user["id"], "authenticity_assessment_created", "evidence", str(evidence_id), {"classification": assessment["classification"]})
+    return {"assessment_id": saved[0]["id"] if saved else None, **assessment}
+
+
+@app.get("/api/evidence/{evidence_id}/authenticity-assessment")
+def get_authenticity_assessment(evidence_id: UUID, user: dict[str, str] = Depends(authenticated_user)):
+    if read_evidence_metadata(evidence_id, user["id"]) is None:
+        raise HTTPException(status_code=404, detail="Evidence file was not found.")
+    rows = get_supabase_client().table("authenticity_assessments").select("id,assessment,created_at").eq("evidence_id", str(evidence_id)).order("created_at", desc=True).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No authenticity assessment is available yet.")
+    return {"assessment_id": rows[0]["id"], "created_at": rows[0]["created_at"], **rows[0]["assessment"]}
 
 
 @app.get("/api/evidence/{evidence_id}/integrity")
-async def evidence_integrity(evidence_id: UUID):
-    evidence_path = find_stored_file(evidence_id)
-    if evidence_path is None:
-        raise HTTPException(status_code=404, detail="Evidence file was not found.")
-    original_hash = read_evidence_metadata(evidence_id).get("sha256_hash")
-    if not original_hash:
-        raise HTTPException(
-            status_code=409,
-            detail="The original upload hash is unavailable for this evidence file.",
-        )
+def evidence_integrity(evidence_id: UUID, user: dict[str, str] = Depends(authenticated_user)):
     try:
-        current_hash = calculate_sha256(evidence_path)
-    except OSError:
-        raise HTTPException(status_code=500, detail="Evidence file could not be verified.") from None
-    return {
-        "evidence_id": str(evidence_id),
-        "original_sha256_hash": original_hash,
-        "current_sha256_hash": current_hash,
-        "verified": hmac.compare_digest(original_hash, current_hash),
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-    }
+        result = verify_evidence_integrity(evidence_id, user["id"])
+    except EvidenceUploadError as exc:
+        try:
+            set_processing_status(evidence_id, user["id"], "failed", "The original file could not be retrieved for processing.")
+            append_audit_event(user["id"], "analysis_failed", "evidence", str(evidence_id), {"error_type": "storage"})
+        except Exception:
+            pass
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+    append_audit_event(user["id"], "integrity_verified", "evidence", str(evidence_id), {"verification_status": result["verification_status"]})
+    return {"evidence_id": result["evidence_id"], "original_sha256_hash": result["original_hash"],
+            "current_sha256_hash": result["current_hash"], "verified": result["verified"],
+            "verification_status": result["verification_status"], "checked_at": result["verified_at"]}
 
 
 @app.get("/api/integrity")
-async def integrity():
+def integrity(user: dict[str, str] = Depends(authenticated_user)):
     results = []
-    for record in list_evidence_records():
-        evidence_id = UUID(record["evidence_id"])
-        evidence_path = find_stored_file(evidence_id)
-        original_hash = record.get("sha256_hash")
-        if evidence_path is None or not original_hash:
-            verified = False
-            current_hash = None
-        else:
-            try:
-                current_hash = calculate_sha256(evidence_path)
-                verified = hmac.compare_digest(original_hash, current_hash)
-            except OSError:
-                current_hash = None
-                verified = False
-        results.append({
-            "evidence_id": record["evidence_id"],
-            "original_filename": record["original_filename"],
-            "original_sha256_hash": original_hash,
-            "current_sha256_hash": current_hash,
-            "verified": verified,
-        })
-    exceptions = sum(not item["verified"] for item in results)
-    return {
-        "status": "no_evidence" if not results else "verified" if exceptions == 0 else "attention_required",
-        "items_checked": len(results),
-        "exceptions": exceptions,
-        "algorithm": "SHA-256",
-        "items": results,
-    }
+    for record in list_evidence_records(user["id"]):
+        try:
+            result = verify_evidence_integrity(UUID(record["evidence_id"]), user["id"])
+        except EvidenceUploadError:
+            result = {"evidence_id": record["evidence_id"], "original_hash": record.get("sha256_hash"), "current_hash": None, "verified": False, "verification_status": "failed", "verified_at": None}
+        results.append({"evidence_id": record["evidence_id"], "original_filename": record["original_filename"],
+                        "original_sha256_hash": result["original_hash"], "current_sha256_hash": result["current_hash"],
+                        "verified": result["verified"], "verification_status": result["verification_status"]})
+    failures = sum(1 for item in results if not item["verified"])
+    return {"status": "no_evidence" if not results else "verified" if not failures else "attention_required",
+            "items_checked": len(results), "exceptions": failures, "algorithm": "SHA-256", "items": results}
+
+
+@app.get("/api/audit")
+def audit_log(limit: int = 100, user: dict[str, str] = Depends(authenticated_user)):
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 500.")
+    rows = get_supabase_client().table("audit_logs").select(
+        "id,actor_id,action,resource_type,resource_id,event_data,previous_hash,current_hash,created_at"
+    ).eq("actor_id", user["id"]).order("created_at", desc=True).limit(limit).execute().data or []
+    return {"items": rows}

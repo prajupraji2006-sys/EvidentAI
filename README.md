@@ -1,70 +1,77 @@
-# EvidentAI
+﻿# EvidentAI
 
-EvidentAI is an AI-powered digital evidence intelligence platform starter for organizing and reviewing evidence. This repository contains a React + Vite frontend and a Python + FastAPI backend. Uploaded files and analysis metadata are stored temporarily on the backend filesystem; no database or Supabase connection is configured.
+EvidentAI is a React/Vite evidence review interface backed by FastAPI, Supabase Auth, Supabase Postgres, private Supabase Storage, and Gemini analysis. The original evidence file is stored separately from extracted text and analysis. No sample evidence is inserted into production workflows.
 
-## Requirements
+## Current architecture
 
-- Node.js 18+ and npm
-- Python 3.10+
+- **Frontend:** React 18, Vite, React Router, Supabase Auth. Browser requests use the Supabase publishable key and the signed-in user's bearer token.
+- **Backend:** Python 3.10+, FastAPI. The Supabase secret/service key and Gemini API key stay server-side.
+- **Database and storage:** Existing `profiles`, `incidents`, `evidence`, and `evidence_hashes` tables and the private `evidence-files` bucket. A migration in `supabase/migrations/` adds analysis, authenticity, audit-chain, owner-policy, duplicate, and analysis-status support.
+- **Evidence pipeline:** Extension, declared MIME, and basic file-signature validation, a 200 MB cap, streamed local hashing, private Storage upload, metadata and SHA-256 records, PDF/text/CSV extraction, image OCR, audio transcription, and Gemini structured analysis. The Tesseract OCR engine must be installed on the backend host and available on PATH; `pytesseract` is only its Python wrapper.
+- **Assessment limits:** Authenticity checks report measurable metadata and always classify results as `INCONCLUSIVE` until a validated forensic detector is added. The service does not prove fraud, genuineness, manipulation, or AI generation.
 
-## Run the frontend
+## Local setup
 
-```bash
+Copy `backend/.env.example` to `backend/.env` and `frontend/.env.example` to `frontend/.env.local`. Fill the backend file with `SUPABASE_URL`, a server-only `SUPABASE_SECRET_KEY`, and `GEMINI_API_KEY`. Fill the frontend file with `VITE_SUPABASE_URL`, the public `VITE_SUPABASE_PUBLISHABLE_KEY`, and the backend URL in `VITE_API_BASE_URL`. Never place the Supabase secret/service-role key or Gemini key in a `VITE_` variable.
+
+Install and run the backend:
+
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8765
+```
+
+Install and run the frontend in another terminal:
+
+```powershell
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Vite serves the app at http://localhost:5173. Set `VITE_API_BASE_URL` in `frontend/.env` to change the backend URL; it defaults to `http://localhost:8000`.
+Configure Supabase Auth email confirmation and redirect URLs for the local Vite origin. In the app, sign in. The frontend waits for the backend to ensure the signed-in user's profile exists, then create or select an active incident and upload a supported file. A failed processing job retains the original evidence record and can be retried from the Evidence Vault.
 
-## Run the backend
+## Supabase migration
 
-```bash
-cd backend
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
+The existing database and private bucket were inspected read-only. The database currently lacks the `evidence_analysis`, `authenticity_assessments`, and `audit_logs` tables. Review and apply `supabase/migrations/202611150001_evidence_security_foundation.sql` in the Supabase SQL Editor or with the Supabase CLI before using analysis persistence, authenticity assessment, or the audit trail. The migration enables owner-scoped RLS and keeps the evidence bucket private. The backend also filters each service-role query by the authenticated user because service-role requests bypass RLS.
 
-The API runs at http://localhost:8000. Interactive docs are at http://localhost:8000/docs and health check at http://localhost:8000/api/health. CORS allows the Vite development origin; configure `FRONTEND_ORIGIN` to change it.
+Do not apply this migration to a different Supabase project without reviewing its existing policies. The migration replaces policies on the EvidentAI application tables with the documented owner rules.
 
-To enable Gemini analysis, copy `backend/.env.example` to `backend/.env`, then set `GEMINI_API_KEY` in that backend-only file. `GEMINI_MODEL` is optional; it defaults to `gemini-3.8-flash`. Never put the Gemini key in the frontend.
+## API
 
-## Analyze evidence text
+Public endpoints: `GET /` and `GET /api/health`.
 
-Start the backend, open http://127.0.0.1:8000/docs, expand **POST /api/analyze**, select **Try it out**, submit this request, and select **Execute**:
+All other endpoints require `Authorization: Bearer <Supabase access token>`:
 
-```json
-{
-  "evidence_text": "On 2025-04-12, Jordan Lee met Casey Morgan at the North Station office. A payment was discussed at 14:30."
-}
-```
+- `POST /api/analyze`
+- `POST /api/profile/bootstrap`
+- `GET, POST /api/cases`
+- `GET /api/dashboard`
+- `GET /api/evidence`
+- `POST /api/evidence/upload` (multipart `file` and `incident_id`)
+- `POST /api/evidence/{evidence_id}/analyze`
+- `GET /api/timeline`, `/api/graph`, `/api/summary`
+- `POST, GET /api/evidence/{evidence_id}/authenticity-assessment`
+- `GET /api/evidence/{evidence_id}/integrity`, `GET /api/integrity`
+- `GET /api/audit` and `POST /api/audit/login`
 
-The response contains `summary`, `people`, `locations`, `dates`, `events` (in chronological order, each with `date_or_time` and `description`), and `concerns`. The endpoint analyzes the submitted text without storing it. Invalid input returns HTTP 422, missing Gemini configuration returns HTTP 503, and Gemini or invalid-response failures return HTTP 502.
+Interactive API docs are available locally at `http://localhost:8765/docs`.
 
-Evidence files and their small metadata/analysis sidecars are stored locally under `backend/uploads/`. This is temporary file storage; no database or Supabase connection is configured. Dashboard, evidence list, timeline, graph, summary, and integrity responses are derived from these local records. Cases remain empty until the separate database integration is added.
+## Verification
 
-## Extract and analyze a PDF
+Run backend tests after `pip install -r requirements-dev.txt` with `cd backend; python -m pytest -q`. Build the frontend with `cd frontend; npm run build`. Tests use clearly synthetic temporary fixtures and do not write to Supabase.
 
-1. Open http://127.0.0.1:8000/docs and use **POST /api/evidence/upload** to upload a readable, text-based PDF. Copy the `evidence_id` from the response.
-2. In Swagger, open **POST /api/evidence/{evidence_id}/analyze**, choose **Try it out**, paste that UUID into the `evidence_id` field, and choose **Execute**.
+## Deployment
 
-The endpoint reads the PDF already stored in `backend/uploads/`, extracts its text with pypdf, and sends it to the existing Gemini analysis service. It returns the evidence ID, original filename, a short text preview, extraction status, and structured analysis. The full extracted text is not returned. Scanned image-only PDFs are not supported because OCR is not enabled. Missing files, non-PDF evidence, unreadable PDFs, empty extraction results, oversized extracted text, and Gemini errors return clear HTTP errors. No database is used.
+`render.yaml` and `frontend/vercel.json` provide deployment configuration for Render and Vercel. Before deploying, apply the migration, set backend secrets in Render, set the three frontend variables in Vercel, set `FRONTEND_ORIGINS` to the exact deployed frontend origin, configure Supabase Auth redirect URLs, and run end-to-end checks against the deployed services. No public URLs are configured or claimed by this repository.
 
-## Upload evidence files
+## Known limitations
 
-Open http://127.0.0.1:8000/docs, expand **POST /api/evidence/upload**, choose **Try it out**, select one file, and choose **Execute**. Supported extensions are `.pdf`, `.jpg`, `.jpeg`, `.png`, `.txt`, `.csv`, `.mp3`, `.wav`, and `.m4a`; files must be non-empty and no larger than 200 MB. A successful response includes the evidence UUID, detected category, byte size, SHA-256 hash, upload status, and UTC upload time. Uploaded files are stored temporarily under `backend/uploads/`; that directory is ignored by Git. No database is used.
-
-## Analyze uploaded evidence
-
-After uploading a file, copy its `evidence_id` and call **POST /api/evidence/{evidence_id}/analyze** in Swagger. The backend extracts text from PDF, TXT, and CSV files, runs OCR on images, and transcribes supported audio before sending the resulting text to Gemini. Results are saved in the temporary evidence metadata so the dashboard, timeline, relationship graph, and AI Summary pages can display them. **POST /api/analyze** remains available for direct text analysis.
-
-Image OCR uses Pillow and the `pytesseract` Python wrapper, plus the separate Tesseract OCR executable. On Windows, install Tesseract using the [official Tesseract installation guidance](https://github.com/tesseract-ocr/tessdoc/blob/main/Installation.md), ensure `tesseract.exe` is on `PATH`, then restart the terminal and backend. If the executable is unavailable, image analysis returns an actionable error. OCR only extracts visible text; scanned PDFs still require OCR support and currently return a clear no-extractable-text response.
-
-Audio transcription uses Gemini's `gemini-3.5-transcribe` model through the existing backend Gemini credentials and Files API; no local FFmpeg or speech-recognition package is required. Audio is sent to Gemini for transcription and the temporary remote file is deleted after the request. This requires network access and an enabled Gemini API key. See Google's [audio transcription documentation](https://ai.google.dev/gemini-api/docs/transcribe?hl=en) for supported formats and service limits.
-
-## Integrity re-verification
-
-Open **Integrity Center** in the frontend and choose **Re-verify** for an evidence item, or call `GET /api/evidence/{evidence_id}/integrity` from Swagger. The endpoint recalculates SHA-256 and compares it with the hash recorded at upload.
+- Evidence processing currently runs synchronously in the API request; there is no durable worker or job queue.
+- MP3/M4A metadata extraction, signed PDF signature verification, C2PA validation, perceptual-hash image comparison, reliable AI-generated-content detection, contradiction detection, and source-region citations are not implemented.
+- There is no secure evidence download/preview endpoint yet.
+- Audit hash chaining covers implemented backend actions only. Login events, downloads, deletions, and sharing actions are not yet recorded.
+- The Supabase migration must be applied to the intended project. Production deployment and authenticated end-to-end upload have not been verified.

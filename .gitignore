@@ -20,3 +20,10 @@ Desktop.ini
 *.swp
 *.swo
 *.tmp
+
+# Local environment files and deployment credentials
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env.local
